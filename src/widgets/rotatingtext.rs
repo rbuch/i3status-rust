@@ -84,6 +84,7 @@ impl RotatingTextWidget {
     pub fn with_text(mut self, content: &str) -> Self {
         self.content = String::from(content);
         self.rotation_pos = 0;
+        self.rotating = false;
         if self.content.chars().count() > self.max_width {
             self.next_rotation = Some(Instant::now() + self.rotation_interval);
         } else {
@@ -108,6 +109,7 @@ impl RotatingTextWidget {
         if self.content != content {
             self.content = content;
             self.rotation_pos = 0;
+            self.rotating = false;
             if self.content.chars().count() > self.max_width {
                 self.next_rotation = Some(Instant::now() + self.rotation_interval);
             } else {
@@ -165,10 +167,10 @@ impl RotatingTextWidget {
             }
         );
         self.inner.min_width = {
-            if self.dynamic_width || self.content.is_empty() {
+            if (self.dynamic_width && !self.rotating) || self.content.is_empty() {
                 None
             } else {
-                icon.push_str(&"0".repeat(self.max_width + 1));
+                icon.push_str(&"0".repeat(self.max_width));
                 Some(I3BarBlockMinWidth::Text(icon))
             }
         };
