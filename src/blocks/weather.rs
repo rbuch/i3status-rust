@@ -31,7 +31,14 @@ pub enum WeatherService {
         #[serde(default = "WeatherService::getenv_openweathermap_place")]
         place: Option<String>,
         coordinates: Option<(String, String)>,
-        units: OpenWeatherMapUnits,
+        units: WeatherUnits,
+        #[serde(default = "WeatherService::default_lang")]
+        lang: Option<String>,
+    },
+    Wttr {
+        place: Option<String>,
+        coordinates: Option<(String, String)>,
+        units: WeatherUnits,
         #[serde(default = "WeatherService::default_lang")]
         lang: Option<String>,
     },
@@ -54,7 +61,7 @@ impl WeatherService {
 
 #[derive(Copy, Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub enum OpenWeatherMapUnits {
+pub enum WeatherUnits {
     Metric,
     Imperial,
 }
@@ -74,7 +81,7 @@ fn malformed_json_error() -> Error {
 }
 
 // TODO: might be good to allow for different geolocation services to be used, similar to how we have `service` for the weather API
-fn find_ip_location() -> Result<Option<String>> {
+fn find_ip_location(include_region: bool) -> Result<Option<String>> {
     let http_call_result = http::http_get_json(
         "https://ipapi.co/json/",
         Some(Duration::from_secs(3)),
@@ -86,9 +93,22 @@ fn find_ip_location() -> Result<Option<String>> {
         .pointer("/city")
         .map(|v| v.as_str())
         .flatten()
-        .map(|s| s.to_string());
+        .map(|s| s.to_string())
+        .ok_or_else(malformed_json_error)?;
 
-    Ok(city)
+    if !include_region {
+        Ok(Some(city))
+    } else {
+        let region = http_call_result
+            .content
+            .pointer("/region")
+            .map(|v| v.as_str())
+            .flatten()
+            .map(|s| s.to_string())
+            .ok_or_else(malformed_json_error)?;
+
+        Ok(Some(vec![city, region].join(",")))
+    }
 }
 
 // Compute the Australian Apparent Temperature (AT),
@@ -98,11 +118,11 @@ fn australian_apparent_temp(
     raw_temp: f64,
     raw_humidity: f64,
     raw_wind_speed: f64,
-    units: OpenWeatherMapUnits,
+    units: WeatherUnits,
 ) -> f64 {
-    let metric = units == OpenWeatherMapUnits::Metric;
+    let metric = units == WeatherUnits::Metric;
 
-    let temp_celsius = if units == OpenWeatherMapUnits::Metric {
+    let temp_celsius = if units == WeatherUnits::Metric {
         raw_temp
     } else {
         // convert Fahrenheit to Celsius
@@ -170,7 +190,7 @@ impl Weather {
                 let api_key = api_key_opt.as_ref().unwrap();
 
                 let geoip_city = if self.autolocate {
-                    find_ip_location().ok().unwrap_or(None) // If geo location fails, try other configuration methods
+                    find_ip_location(false).ok().unwrap_or(None) // If geo location fails, try other configuration methods
                 } else {
                     None
                 };
@@ -201,8 +221,8 @@ impl Weather {
                     location_query = location_query,
                     api_key = api_key,
                     units = match *units {
-                        OpenWeatherMapUnits::Metric => "metric",
-                        OpenWeatherMapUnits::Imperial => "imperial",
+                        WeatherUnits::Metric => "metric",
+                        WeatherUnits::Imperial => "imperial",
                     },
                     lang = lang.as_ref().unwrap(),
                 );
@@ -276,7 +296,7 @@ impl Weather {
                     _ => "weather_default",
                 })?;
 
-                let kmh_wind_speed = if *units == OpenWeatherMapUnits::Metric {
+                let kmh_wind_speed = if *units == WeatherUnits::Metric {
                     raw_wind_speed * 3600.0 / 1000.0
                 } else {
                     // convert mph to m/s, then km/h
@@ -297,6 +317,153 @@ impl Weather {
                     "direction" => Value::from_string(convert_wind_direction(raw_wind_direction)),
                     "location" => Value::from_string(raw_location),
                 );
+                Ok(())
+            }
+            WeatherService::Wttr {
+                place,
+                coordinates,
+                units,
+                lang,
+            } => {
+                let geoip_location = if self.autolocate {
+                    find_ip_location(true).ok().unwrap_or(None)
+                } else {
+                    None
+                };
+
+                let location_query = if let Some(location) = geoip_location {
+                    location.clone()
+                } else if let Some(p) = place.as_ref() {
+                    p.clone()
+                } else if let Some((lat, lon)) = coordinates.as_ref() {
+                    format!("{},{}", lat, lon)
+                } else {
+                    "".to_string()
+                };
+
+                // Refer to https://wttr.in/:help and https://github.com/chubin/wttr.in
+                let wttr_url = &format!(
+                    "https://wttr.in/{location_query}?format=j1&lang={lang}",
+                    location_query = location_query,
+                    lang = lang.as_ref().unwrap()
+                );
+
+                let raw_output =
+                    http::http_get_json(wttr_url, Some(Duration::from_secs(5)), vec![]);
+
+                let output = match raw_output {
+                    Ok(v) => v,
+                    Err(e) => panic!("{:?}", e),
+                };
+
+                // All 300-399 and >500 http codes should be considered as temporary error,
+                // and not result in block error, i.e. leave the output empty.
+                if (output.code >= 300 && output.code < 400) || output.code >= 500 {
+                    return Err(BlockError(
+                        "weather".to_owned(),
+                        format!("Invalid result from curl: {}", output.code),
+                    ));
+                };
+
+                let json = output.content;
+
+                let raw_weather = json
+                    .pointer("/current_condition/0/weatherDesc/0/value")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(malformed_json_error)?
+                    .to_string();
+
+                let raw_weather_verbose = if let Some(lang) = json.pointer(
+                    format!(
+                        "/current_condition/0/lang_{lang}/0/value",
+                        lang = lang.as_ref().unwrap()
+                    )
+                    .as_str(),
+                ) {
+                    lang.as_str().ok_or_else(malformed_json_error)?.to_string()
+                } else {
+                    raw_weather.clone()
+                };
+
+                let raw_temp = json
+                    .pointer(match *units {
+                        WeatherUnits::Metric => "/current_condition/0/temp_C",
+                        WeatherUnits::Imperial => "/current_condition/0/temp_F",
+                    })
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .ok_or_else(malformed_json_error)?;
+
+                let raw_humidity = json
+                    .pointer("/current_condition/0/humidity")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .or(Some(0.0)) // provide default value 0.0
+                    .ok_or_else(malformed_json_error)?;
+
+                let raw_wind_speed: f64 = json
+                    .pointer(match *units {
+                        WeatherUnits::Metric => "/current_condition/0/windspeedKmph",
+                        WeatherUnits::Imperial => "/current_condition/0/windspeedMiles",
+                    })
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .or(Some(0.0)) // provide default value 0.0
+                    .ok_or_else(malformed_json_error)?; // error when conversion to f64 fails
+
+                let raw_wind_direction: Option<f64> = json
+                    .pointer("/current_condition/0/winddirDegree")
+                    .and_then(|v| v.as_str())
+                    .map_or(Some(None), |v| v.parse::<f64>().ok().map(Some)) // provide default value None
+                    .ok_or_else(malformed_json_error)?; // error when conversion to f64 fails
+
+                let raw_location = json
+                    .pointer("/nearest_area/0/areaName/0/value")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .ok_or_else(malformed_json_error)?;
+
+                let raw_weather_code = json
+                    .pointer("/current_condition/0/weatherCode")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse::<u16>().ok())
+                    .ok_or_else(malformed_json_error)?;
+
+                // Refer to https://www.worldweatheronline.com/developer/api/docs/weather-icons.aspx for this mapping
+                self.weather.set_icon(match raw_weather_code {
+                    113 | 116 => "weather_sun",
+                    119 | 122 | 143 | 248 | 260 => "weather_clouds",
+                    176 | 179 | 182 | 185 | 263 | 266 | 281 | 284 | 293 | 296 | 299 | 302 | 305
+                    | 308 | 311 | 314 | 317 | 320 | 353 | 356 | 359 | 362 | 365 => "weather_rain",
+                    200 | 386 | 389 | 392 | 395 => "weather_thunder",
+                    227 | 230 | 323 | 326 | 329 | 332 | 335 | 338 | 350 | 368 | 371 | 374 | 377 => {
+                        "weather_snow"
+                    }
+                    _ => "weather_default",
+                })?;
+
+                let kmh_wind_speed = if *units == WeatherUnits::Metric {
+                    raw_wind_speed * 3600.0 / 1000.0
+                } else {
+                    // convert mph to m/s, then km/h
+                    (raw_wind_speed * 0.447) * 3600.0 / 1000.0
+                };
+
+                let apparent_temp =
+                    australian_apparent_temp(raw_temp, raw_humidity, raw_wind_speed, *units);
+
+                self.weather_keys = map!(
+                    "weather" => Value::from_string(raw_weather),
+                    "weather_verbose" => Value::from_string(raw_weather_verbose),
+                    "temp" => Value::from_integer(raw_temp as i64).degrees(),
+                    "humidity" => Value::from_integer(raw_humidity as i64),
+                    "apparent" => Value::from_integer(apparent_temp as i64).degrees(),
+                    "wind" => Value::from_float(raw_wind_speed),
+                    "wind_kmh" => Value::from_float(kmh_wind_speed),
+                    "direction" => Value::from_string(convert_wind_direction(raw_wind_direction)),
+                    "location" => Value::from_string(raw_location),
+                );
+
                 Ok(())
             }
         }
